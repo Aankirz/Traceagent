@@ -1,31 +1,106 @@
-import subprocess
-import signal
-import sys
-import os
-import time
+import platform
 import pyshark
-import requests
-from datetime import datetime
-from queue import Queue, Empty
+import time
 import threading
+import requests
+import argparse
+import os
+import socket
+import uuid
+import json
+from queue import Queue, Empty
+from datetime import datetime
 
-# Path to the pcap file
-PCAP_PATH = "/var/log/agent/traffic.pcap"
-# The interface to monitor
-INTERFACE = "eth0"
-# Backend URL
-BACKEND_URL = "http://localhost:4000/api/logs"
-
-# Session threshold for example
+# Default configuration
 SESSION_PACKET_THRESHOLD = 10
-# Batching interval
 BATCH_SEND_INTERVAL = 10
-# Batching size
 BATCH_SIZE = 5
+DEFAULT_BACKEND_URL = "http://localhost:4000/api/sessions"
+HEALTH_CHECK_URL = "http://localhost:4000/api/health"
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
 
-# In-memory sessions (key: ( (src_ip, src_port), (dst_ip, dst_port), protocol ))
 active_sessions = {}
 session_queue = Queue()
+
+# Generate a unique device ID or load from file if exists
+def get_device_id():
+    device_id_file = os.path.join(os.path.expanduser("~"), ".snaptrace_device_id")
+    
+    if os.path.exists(device_id_file):
+        try:
+            with open(device_id_file, 'r') as f:
+                return f.read().strip()
+        except:
+            pass
+    
+    # Generate new ID if file doesn't exist or couldn't be read
+    device_id = str(uuid.uuid4())
+    
+    try:
+        with open(device_id_file, 'w') as f:
+            f.write(device_id)
+    except:
+        print(f"Warning: Could not save device ID to {device_id_file}")
+    
+    return device_id
+
+def get_device_info():
+    """Collect information about the device running the agent."""
+    try:
+        hostname = socket.gethostname()
+        ip_address = socket.gethostbyname(hostname)
+        os_info = f"{platform.system()} {platform.release()}"
+        device_id = get_device_id()
+        
+        return {
+            "device_id": device_id,
+            "hostname": hostname,
+            "ip_address": ip_address,
+            "os": os_info,
+            "agent_version": "1.0.0"  # Hardcoded for now, could be dynamic in the future
+        }
+    except Exception as e:
+        print(f"Error collecting device info: {e}")
+        return {
+            "device_id": get_device_id(),
+            "agent_version": "1.0.0"
+        }
+
+def check_backend_health(url, api_key=None):
+    """Check if the backend server is available."""
+    headers = {}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+    
+    try:
+        health_url = url.replace('/api/sessions', '/api/health')
+        response = requests.get(health_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            print("Backend server is available")
+            return True
+        else:
+            print(f"Backend server health check failed. Status code: {response.status_code}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"Backend server is not available: {e}")
+        return False
+
+def get_default_interface():
+    """
+    Attempts to choose a default interface based on the OS.
+    This is a simple guess:
+      - macOS => "en0"
+      - Linux => "eth0"
+    """
+    system_name = platform.system().lower()
+    if "darwin" in system_name:  # macOS
+        return "en0"
+    elif "linux" in system_name:
+        return "eth0"
+    else:
+        # If unknown OS, just default to en0 (or raise an error).
+        return "en0"
 
 class SessionData:
     def __init__(self, key):
@@ -63,26 +138,23 @@ class SessionData:
             "Bytes Transferred": f"{self.bytes / (1024 * 1024):.1f}M",
             "Flags": ",".join(self.flags),
             "Duration": self.duration,
-            "Class": "Unknown"  # or do further classification
+            "Class": "Unknown"
         }
 
     def is_complete(self):
         return self.packets >= SESSION_PACKET_THRESHOLD
 
 def process_packet(packet):
-    """
-    Parse relevant fields from the PyShark packet and build session data.
-    """
+    """Parse relevant fields from PyShark's live capture."""
     try:
         if 'ip' not in packet:
             return
 
-        # protocol_layer might be 'tcp', 'udp', etc.
         protocol_layer = packet.transport_layer
         if not protocol_layer:
-            return  # might be something else like ARP, skip
+            return
 
-        protocol = protocol_layer.upper()  # 'TCP', 'UDP'
+        protocol = protocol_layer.upper()  # e.g. 'TCP' or 'UDP'
         layer = getattr(packet, protocol.lower(), None)
         if not layer or not hasattr(layer, 'srcport') or not hasattr(layer, 'dstport'):
             return
@@ -92,19 +164,15 @@ def process_packet(packet):
         src_port = layer.srcport
         dst_port = layer.dstport
 
-        # Approx packet size
         size_bytes = len(packet)
 
-        # Attempt to parse flags if available (for TCP)
         flags = []
         if protocol == "TCP" and hasattr(packet.tcp, 'flags_show'):
-            # e.g. "SYN, ACK"
             flag_str = packet.tcp.flags_show
             flags = [f.strip() for f in flag_str.split(',')]
 
-        timestamp = packet.sniff_time  # a datetime object
+        timestamp = packet.sniff_time
 
-        # Build session key
         endpoints = sorted([(src_ip, src_port), (dst_ip, dst_port)])
         session_key = (endpoints[0], endpoints[1], protocol)
 
@@ -114,6 +182,7 @@ def process_packet(packet):
         session = active_sessions[session_key]
         session.add_packet(timestamp, size_bytes, flags)
 
+        # If we've hit the packet threshold, queue this session for "sending" (printing).
         if session.is_complete():
             session_queue.put(session.to_dict())
             del active_sessions[session_key]
@@ -121,10 +190,11 @@ def process_packet(packet):
     except Exception as e:
         print(f"Error processing packet: {e}")
 
-def send_batches():
-    """
-    Send session data to the backend in batches.
-    """
+def send_batches(backend_url, backend_enabled, api_key=None):
+    """Batch sessions and send them to the backend server."""
+    device_info = get_device_info()
+    print(f"Device info: {json.dumps(device_info, indent=2)}")
+    
     while True:
         time.sleep(BATCH_SEND_INTERVAL)
         batch = []
@@ -135,82 +205,104 @@ def send_batches():
             except Empty:
                 break
 
+        if not batch:
+            continue
+
         for session_dict in batch:
-            try:
-                r = requests.post(BACKEND_URL, json=session_dict)
-                if r.status_code == 200:
-                    print(f"Sent session to backend: {session_dict}")
-                else:
-                    print(f"Failed to send session: {r.status_code}")
-            except Exception as e:
-                print(f"Exception sending session: {e}")
-
-def start_tcpdump():
-    """
-    Launch tcpdump as a subprocess that writes to PCAP_PATH.
-    We'll kill it when script ends.
-    """
-    print(f"Starting tcpdump on interface {INTERFACE}, writing to {PCAP_PATH}")
-    # Make sure directory exists
-    os.makedirs(os.path.dirname(PCAP_PATH), exist_ok=True)
-
-    # Start tcpdump
-    p = subprocess.Popen(
-        ["sudo", "tcpdump", "-i", INTERFACE, "-w", PCAP_PATH],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    return p
-
-def tail_pcap():
-    """
-    Tails the PCAP file using PyShark and processes packets in real-time.
-    """
-    print(f"Tailing pcap file: {PCAP_PATH}")
-    capture = pyshark.FileCapture(
-        PCAP_PATH,
-        keep_packets=False,
-        tail=True
-    )
-
-    try:
-        for packet in capture:
-            process_packet(packet)
-    except Exception as e:
-        print(f"Error in capture loop: {e}")
-    finally:
-        capture.close()
-
-def cleanup(p):
-    """
-    Cleanup function to kill tcpdump on exit.
-    """
-    print("Cleaning up, stopping tcpdump...")
-    p.terminate()
-    try:
-        p.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        p.kill()
-    print("tcpdump stopped.")
+            print(f"Completed session: {session_dict}")
+            
+        # Send batch to backend if enabled
+        if backend_enabled and batch:
+            retries = 0
+            success = False
+            
+            # Prepare headers
+            headers = {
+                'Content-Type': 'application/json'
+            }
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
+            
+            # Prepare payload with metadata
+            payload = {
+                "device_info": device_info,
+                "timestamp": datetime.now().isoformat(),
+                "sessions": batch
+            }
+            
+            while retries < MAX_RETRIES and not success:
+                try:
+                    response = requests.post(backend_url, json=payload, headers=headers)
+                    if response.status_code == 200:
+                        print(f"Successfully sent {len(batch)} sessions to backend")
+                        success = True
+                    else:
+                        print(f"Failed to send sessions to backend. Status code: {response.status_code}")
+                        print(f"Response: {response.text}")
+                        retries += 1
+                        if retries < MAX_RETRIES:
+                            print(f"Retrying in {RETRY_DELAY} seconds... (Attempt {retries+1}/{MAX_RETRIES})")
+                            time.sleep(RETRY_DELAY)
+                except requests.exceptions.RequestException as e:
+                    print(f"Error sending data to backend: {e}")
+                    retries += 1
+                    if retries < MAX_RETRIES:
+                        print(f"Retrying in {RETRY_DELAY} seconds... (Attempt {retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRY_DELAY)
+            
+            if not success:
+                print("Failed to send data after maximum retries")
 
 def main():
-    # 1. Start tcpdump
-    tcpdump_proc = start_tcpdump()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Network traffic collector')
+    parser.add_argument('--backend-url', default=DEFAULT_BACKEND_URL,
+                        help=f'Backend server URL (default: {DEFAULT_BACKEND_URL})')
+    parser.add_argument('--disable-backend', action='store_true',
+                        help='Disable sending data to backend')
+    parser.add_argument('--api-key', default=os.environ.get('SNAPTRACE_API_KEY'),
+                        help='API key for backend authentication (can also be set via SNAPTRACE_API_KEY env variable)')
+    parser.add_argument('--skip-health-check', action='store_true',
+                        help='Skip backend health check on startup')
+    args = parser.parse_args()
+    
+    backend_enabled = not args.disable_backend
+    backend_url = args.backend_url
+    api_key = args.api_key
+    
+    if backend_enabled:
+        print(f"Backend enabled. Sending data to: {backend_url}")
+        if api_key:
+            print("API authentication enabled")
+        else:
+            print("Warning: No API key provided. Authentication disabled.")
+        
+        # Check backend health if not skipped
+        if not args.skip_health_check:
+            if not check_backend_health(backend_url, api_key):
+                print("Warning: Backend server health check failed. Data will still be collected but may not be sent successfully.")
+    else:
+        print("Backend disabled. Running in local mode only.")
+    
+    interface = get_default_interface()
+    print(f"Detected OS: {platform.system()}")
+    print(f"Using default interface: {interface}")
 
-    # 2. Give tcpdump a second to initialize
-    time.sleep(2)
-
-    # 3. Start background thread for sending session batches
-    t = threading.Thread(target=send_batches, daemon=True)
+    # Start background thread to batch completed sessions
+    t = threading.Thread(target=send_batches, args=(backend_url, backend_enabled, api_key), daemon=True)
     t.start()
 
-    # 4. Start tailing the PCAP with PyShark
+    # Start live capture
+    print(f"Starting LiveCapture on interface: {interface}")
+    capture = pyshark.LiveCapture(interface=interface)
+
     try:
-        tail_pcap()
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt detected. Exiting...")
+        for packet in capture.sniff_continuously():
+            process_packet(packet)
+    except (KeyboardInterrupt, EOFError):
+        print("Exiting gracefully...")
     finally:
-        cleanup(tcpdump_proc)
+        capture.close()
 
 if __name__ == "__main__":
     main()
