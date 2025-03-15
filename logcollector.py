@@ -14,7 +14,7 @@ from datetime import datetime
 # Default configuration
 SESSION_PACKET_THRESHOLD = 10
 BATCH_SEND_INTERVAL = 10
-BATCH_SIZE = 5
+BATCH_SIZE = 10
 DEFAULT_BACKEND_URL = "http://localhost:4000/api/sessions"
 HEALTH_CHECK_URL = "http://localhost:4000/api/health"
 MAX_RETRIES = 3
